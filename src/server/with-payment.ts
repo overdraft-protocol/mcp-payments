@@ -1,0 +1,233 @@
+import { randomUUID } from 'crypto';
+import { META_KEYS, MPP_VERSION } from '../protocol/meta.js';
+import {
+  MppAuthorizationSchema,
+  MppChallengeSchema,
+  type MppChallenge,
+  type MppReceipt,
+} from '../protocol/schema.js';
+import type { PaymentRail, PaymentIntent, VerifiedAuthorization, SettlementStrategy, SettlementRef } from '../rails/rail.js';
+import type { ChallengeStore } from './challenge-store.js';
+
+// ── PaymentSpec — supplied by the application (Layer C) ──────────────────────
+
+/**
+ * Per-tool payment specification. The application implements intent() to
+ * describe what payment is required for a given set of tool arguments.
+ * Returning null/undefined means this particular call is not gated (e.g.
+ * file_dispute when the seller is not staked).
+ *
+ * intent() may be async so implementations can do DB lookups (e.g. checking
+ * seller stake before deciding whether to require payment).
+ */
+export interface PaymentSpec {
+  /** Stable tool name — included in the challenge reason. */
+  tool: string;
+  /** Human/agent-readable description of what the payment is for. */
+  description: string;
+  intent(
+    args: Record<string, unknown>,
+  ): PaymentIntent | null | undefined | Promise<PaymentIntent | null | undefined>;
+}
+
+// ── Extra context passed to the wrapped handler ───────────────────────────────
+
+export interface PaymentExtra {
+  /**
+   * The verified payment authorization, available when the tool was gated and
+   * the agent supplied a valid authorization. Undefined when the call was not
+   * gated (intent() returned null) or no auth was present (challenge was issued).
+   *
+   * Use this to access the raw rail payload (e.g. to extract an authorization
+   * JSON for deferred on-chain settlement, as submit_bid does for acceptBid).
+   */
+  verifiedPayment: VerifiedAuthorization | undefined;
+
+  /**
+   * Call this from inside the tool handler — AFTER content-signature and
+   * nonce checks pass — to settle the payment and get a receipt.
+   * Returns undefined when the call was not gated (intent returned null).
+   */
+  settle(): Promise<SettlementRef | undefined>;
+}
+
+// ── Extension config — injected by the application ───────────────────────────
+
+export interface PaymentExtensionConfig {
+  /** Rails the server accepts, in preference order. */
+  rails: PaymentRail[];
+  /** Persists and retrieves issued challenges. */
+  store: ChallengeStore;
+  /** What "settle" actually does — Escrow deposit, bare transfer, card capture, … */
+  settlement: SettlementStrategy;
+  /** TTL for issued challenges in seconds. Default: 300 (5 minutes). */
+  challengeTtlSeconds?: number;
+}
+
+// ── Result helpers ────────────────────────────────────────────────────────────
+
+function challengeResult(challenge: MppChallenge) {
+  return {
+    isError: true as const,
+    content: [
+      {
+        type: 'text' as const,
+        text: `payment_required: ${challenge.reason.description} (${challenge.amount.value} ${challenge.amount.currency}). Retry the same tool call with params._meta["${META_KEYS.authorization}"] containing the signed authorization.`,
+      },
+    ],
+    _meta: {
+      [META_KEYS.challenge]: challenge,
+    },
+  };
+}
+
+function attachReceipt<T extends object>(result: T, receipt: MppReceipt): T & { _meta: Record<string, unknown> } {
+  const existing = (result as Record<string, unknown>)._meta as Record<string, unknown> | undefined;
+  return {
+    ...result,
+    _meta: { ...existing, [META_KEYS.receipt]: receipt },
+  };
+}
+
+// ── Main factory ──────────────────────────────────────────────────────────────
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AnyToolHandler = (args: any, extra: any) => Promise<any>;
+
+/**
+ * Creates a withPayment() higher-order function with injected dependencies.
+ * Call once at server startup; the returned wrapper is transport-agnostic.
+ *
+ * @example
+ * const withPayment = createPaymentExtension({ rails, store, settlement });
+ *
+ * server.registerTool('submit_bid', schema,
+ *   withPayment(spec, async (args, extra) => {
+ *     // 1. validate content signature, consume nonce …
+ *     // 2. do any deferred work that needs extra.verifiedPayment.raw
+ *     await extra.settle();   // funds move HERE, after validation
+ *     return { content: [...] };
+ *   })
+ * );
+ */
+export function createPaymentExtension(cfg: PaymentExtensionConfig) {
+  const railMap = new Map(cfg.rails.map(r => [r.id, r]));
+  const ttlMs = (cfg.challengeTtlSeconds ?? 300) * 1000;
+
+  return function withPayment(
+    spec: PaymentSpec,
+    handler: (
+      args: Record<string, unknown>,
+      extra: Record<string, unknown> & PaymentExtra,
+    ) => Promise<unknown>,
+  ): AnyToolHandler {
+    return async (
+      args: Record<string, unknown>,
+      extra: Record<string, unknown>,
+    ): Promise<unknown> => {
+      // ── Step 1: ask the application whether this call is gated ──────────
+      const intent = await spec.intent(args);
+      if (!intent) {
+        // Not gated — pass straight through with no-op settle + no verifiedPayment.
+        return handler(args, {
+          ...extra,
+          verifiedPayment: undefined,
+          settle: async () => undefined,
+        });
+      }
+
+      // ── Step 2: check for an incoming authorization in params._meta ─────
+      const rawMeta = (extra._meta as Record<string, unknown> | undefined) ?? {};
+      const authParsed = MppAuthorizationSchema.safeParse(rawMeta[META_KEYS.authorization]);
+
+      if (!authParsed.success) {
+        // No valid authorization — issue a challenge.
+        const paymentRequestId = randomUUID();
+        const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+
+        const offers = Object.fromEntries(
+          cfg.rails.map(r => [r.id, r.buildOffer(intent)]),
+        );
+
+        const challenge = MppChallengeSchema.parse({
+          mppVersion: MPP_VERSION,
+          paymentRequestId,
+          expiresAt,
+          reason: { tool: spec.tool, description: spec.description },
+          amount: intent.amount,
+          accepts: Object.values(offers),
+        });
+
+        await cfg.store.save({ challenge, intent, offers });
+        return challengeResult(challenge);
+      }
+
+      const auth = authParsed.data;
+
+      // ── Step 3: consume the challenge (single-use) ───────────────────────
+      const record = await cfg.store.consume(auth.paymentRequestId);
+      if (!record) {
+        return {
+          isError: true as const,
+          content: [{ type: 'text' as const, text: 'payment_error: challenge expired, already used, or not found. Restart the payment flow by calling the tool without authorization first.' }],
+        };
+      }
+
+      // ── Step 4: find the rail + verify (no money moves yet) ─────────────
+      const rail = railMap.get(auth.rail);
+      if (!rail) {
+        return {
+          isError: true as const,
+          content: [{ type: 'text' as const, text: `payment_error: unknown rail "${auth.rail}". Supported: ${[...railMap.keys()].join(', ')}.` }],
+        };
+      }
+
+      const offer = record.offers[auth.rail];
+      if (!offer) {
+        return {
+          isError: true as const,
+          content: [{ type: 'text' as const, text: `payment_error: no offer was issued for rail "${auth.rail}".` }],
+        };
+      }
+
+      let verified: VerifiedAuthorization;
+      try {
+        verified = await rail.verify(auth.payload, offer);
+      } catch (err) {
+        return {
+          isError: true as const,
+          content: [{ type: 'text' as const, text: `payment_error: authorization verification failed — ${String(err)}` }],
+        };
+      }
+
+      // ── Step 5: inject settle() + verifiedPayment — handler calls settle() post-validation
+      let settlementRef: SettlementRef | undefined;
+      const settle = async (): Promise<SettlementRef> => {
+        if (settlementRef) return settlementRef; // idempotent
+        settlementRef = await cfg.settlement.settle(verified, record.intent.binding);
+        return settlementRef;
+      };
+
+      const result = await handler(args, {
+        ...extra,
+        verifiedPayment: verified,
+        settle,
+      });
+
+      // ── Step 6: attach receipt if settlement occurred ────────────────────
+      if (settlementRef) {
+        const receipt: MppReceipt = {
+          mppVersion: MPP_VERSION,
+          paymentRequestId: auth.paymentRequestId,
+          rail: auth.rail,
+          settlementRef: settlementRef.ref,
+          amount: verified.amount,
+          settledAt: new Date().toISOString(),
+        };
+        return attachReceipt(result as object, receipt);
+      }
+
+      return result;
+    };
+  };
+}
