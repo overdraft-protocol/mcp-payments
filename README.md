@@ -85,6 +85,28 @@ On success, the result carries a receipt in `result._meta`:
 - **Verify before settle** — the package verifies the authorization before calling the tool handler. The handler's `settle()` callback moves funds *after* any application-level validation (e.g. content signatures). Money never moves on an invalid request.
 - **Conditional gating** — `intent()` can return `null` to skip the challenge entirely for calls that don't require payment.
 
+## Why `isError: true` and not a proper JSON-RPC error?
+
+A payment challenge semantically isn't a tool failure — it's a mid-execution pause
+requesting input. A JSON-RPC `error` object with a fixed code and structured `data`
+would be the right shape, but the installed MCP SDK (`@modelcontextprotocol/sdk`
+v1.29.0, current latest) catches all `McpError` throws from tool handlers and
+flattens them to a plain `isError` text result, **dropping `data` entirely** — except
+for the single special code `UrlElicitationRequired`.
+
+The `isError: true` + `_meta` approach is therefore the only channel that reliably
+carries structured challenge data to the caller today. It is also consistent with the
+MCP spec, which says tool-originated errors should live in `isError` results so the
+LLM can see and react to them.
+
+**The long-term path is MCP elicitation (`elicitation/create`).** When a
+`PaymentAuthorizationRequired` error code is added to the SDK (following the same
+carve-out as `UrlElicitationRequired`), `withPayment` can be updated to throw it
+instead of returning an `isError` result. No tool handler or marketplace wiring
+changes — the switch is entirely inside the wrapper. See
+[`docs/mcp-payment-protocol.md` § 9](../../docs/mcp-payment-protocol.md) for a
+detailed analysis of why elicitation is not yet feasible.
+
 ## Installation
 
 ```bash
@@ -145,7 +167,28 @@ server.registerTool(
 );
 ```
 
-### 3. Conditional gating
+### 3. Argument fallback for agents that cannot set `params._meta`
+
+Standard LLM harnesses only let the model control `arguments` — `params._meta` is populated by the client host. `withPayment` automatically checks `args.payment_authorization` if `_meta` does not contain an authorization. The value must be a JSON string of the authorization object, or the object itself:
+
+```json
+{ "arguments": { "..": "..", "payment_authorization": "{\"mppVersion\":1,\"paymentRequestId\":\"...\",\"rail\":\"x402-evm-exact\",\"payload\":{...}}" } }
+```
+
+To make `payment_authorization` reachable in the handler (Zod strips unknown fields), declare it in the tool's `inputSchema`:
+
+```ts
+inputSchema: {
+  amount_usdc: z.number(),
+  payment_authorization: z.string().optional().describe(
+    'JSON-encoded MPP authorization. Alternative to params._meta["mcp-payments/v1.authorization"].'
+  ),
+}
+```
+
+`params._meta` always takes priority if both are present.
+
+### 4. Conditional gating
 
 Return `null` from `intent()` to skip payment for calls that don't require it:
 

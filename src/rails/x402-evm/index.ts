@@ -11,6 +11,7 @@
 
 import type { PaymentRail, PaymentIntent, VerifiedAuthorization } from '../rail.js';
 import type { RailOffer } from '../../protocol/schema.js';
+import { inspectRawPaymentPayload, normalizeX402PaymentPayload } from './normalize.js';
 
 export const RAIL_ID = 'x402-evm-exact';
 
@@ -23,6 +24,9 @@ export interface X402EvmRailConfig {
   assetAddress: `0x${string}`;
   /** Network identifier as x402 expects it, e.g. "base". */
   network: string;
+  /** EIP-712 domain chainId. When provided, included in challenge offers so
+   *  agents with standard EIP-712 wallets can sign without mapping network strings. */
+  chainId?: number | bigint;
   /** Token symbol for display, e.g. "USDC". */
   currencySymbol: string;
   /** Decimal places, e.g. 6 for USDC. */
@@ -60,12 +64,15 @@ export function createX402EvmRail(cfg: X402EvmRailConfig): PaymentRail {
         ? hints.maxTimeoutSeconds
         : 3600;
 
+      const chainId = cfg.chainId !== undefined ? Number(cfg.chainId) : undefined;
+
       return {
         rail: RAIL_ID,
         payTo: intent.payTo,
         requirements: {
           scheme: 'exact',
           network: cfg.network,
+          ...(chainId !== undefined ? { chainId } : {}),
           maxAmountRequired: rawAmount,
           resource: typeof hints.resource === 'string' ? hints.resource : '',
           description: intent.amount.value + ' ' + intent.amount.currency,
@@ -84,18 +91,70 @@ export function createX402EvmRail(cfg: X402EvmRailConfig): PaymentRail {
       const { exact } = await import('x402/schemes');
       const { safeBase64Encode } = await import('x402/shared');
 
-      // Reconstruct PaymentRequirements from the stored offer.requirements
       const requirements = offer.requirements;
+      const rawInspection = inspectRawPaymentPayload(payload);
+      console.log('[payment] x402_raw_payload', JSON.stringify(rawInspection));
 
-      // payload must be a decoded PaymentPayload object (not base64).
-      const payloadJson = safeBase64Encode(JSON.stringify(payload));
-      const decoded = exact.evm.decodePayment(payloadJson);
+      let normalized: Record<string, unknown>;
+      try {
+        normalized = normalizeX402PaymentPayload(payload, offer.requirements);
+      } catch (err) {
+        console.error('[payment] x402_normalize_failed', JSON.stringify({
+          error: String(err),
+          raw: rawInspection,
+          offer_network: requirements.network,
+          offer_payTo: requirements.payTo,
+          offer_maxAmount: requirements.maxAmountRequired,
+        }));
+        throw err;
+      }
+
+      console.log('[payment] x402_normalized_payload', JSON.stringify({
+        x402Version: normalized.x402Version,
+        scheme: normalized.scheme,
+        network: normalized.network,
+        authorization_from: (normalized.payload as { authorization?: { from?: string } })?.authorization?.from,
+        authorization_to: (normalized.payload as { authorization?: { to?: string } })?.authorization?.to,
+        authorization_value: (normalized.payload as { authorization?: { value?: string } })?.authorization?.value,
+      }));
+
+      const payloadJson = safeBase64Encode(JSON.stringify(normalized));
+      let decoded;
+      try {
+        decoded = exact.evm.decodePayment(payloadJson);
+      } catch (err) {
+        console.error('[payment] x402_decode_failed', JSON.stringify({
+          error: String(err),
+          normalized,
+          raw: rawInspection,
+        }));
+        throw new Error(
+          `${String(err)}. ` +
+          'MPP authorization.payload must be the x402 PaymentPayload from sign_payment_authorization.paymentPayload ' +
+          '(top-level network:"base", scheme:"exact") — not the wallet tool wrapper or inner signature/authorization only.',
+        );
+      }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await exact.evm.verify(cfg.publicClient as any, decoded, requirements as any);
       if (!result.isValid) {
+        console.error('[payment] x402_verify_invalid', JSON.stringify({
+          invalidReason: result.invalidReason ?? 'unknown',
+          offer_network: requirements.network,
+          offer_payTo: requirements.payTo,
+          offer_asset: requirements.asset,
+          offer_maxAmount: requirements.maxAmountRequired,
+          decoded_network: (decoded as { network?: string }).network,
+          authorization: (decoded.payload as { authorization?: unknown })?.authorization,
+        }));
         throw new Error(`x402 verification failed: ${result.invalidReason ?? 'unknown'}`);
       }
+
+      console.log('[payment] x402_verify_ok', JSON.stringify({
+        from: (decoded.payload as { authorization: { from: string } }).authorization.from,
+        to: (decoded.payload as { authorization: { to: string } }).authorization.to,
+        value: (decoded.payload as { authorization: { value: string } }).authorization.value,
+      }));
 
       // Extract actual authorized amount from the EIP-3009 field.
       const evmPayload = decoded.payload as { authorization: { value: string } };
