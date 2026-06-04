@@ -13,6 +13,14 @@
     "./rails/x402-evm": {
       "import": "./dist/rails/x402-evm/index.js",
       "types": "./dist/rails/x402-evm/index.d.ts"
+    },
+    "./server/authorization-shape": {
+      "import": "./dist/server/authorization-shape.js",
+      "types": "./dist/server/authorization-shape.d.ts"
+    },
+    "./server/payment-log": {
+      "import": "./dist/server/payment-log.js",
+      "types": "./dist/server/payment-log.d.ts"
     }
   },
   "scripts": {
