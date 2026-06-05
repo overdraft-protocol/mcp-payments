@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `@overdraft/mcp-payments` are documented here. This
+All notable changes to `@overdraft-protocol/mpx` are documented here. This
 project adheres to [Semantic Versioning](https://semver.org/). The on-the-wire
 protocol is versioned separately by `mpxVersion` (currently `1`); a breaking
 protocol change bumps that field and the package major.
@@ -15,10 +15,10 @@ protocol change bumps that field and the package major.
   `authorizationArgDescription`. The core calls these generically, so a payment
   rail owns its own agent-facing ergonomics with no app- or rail-knowledge in
   the wrapper.
-- **Removed the `@overdraft/mcp-payments/server/authorization-shape` export.**
+- **Removed the `@overdraft-protocol/mpx/server/authorization-shape` export.**
   `coerceAgentPaymentAuthorization`, `paymentRetryInstructions`, and
   `PAYMENT_AUTHORIZATION_ARG_DESCRIPTION` now live with the x402 rail and are
-  exported from `@overdraft/mcp-payments/rails/x402-evm` as
+  exported from `@overdraft-protocol/mpx/rails/x402-evm` as
   `coerceX402Authorization`, `x402RetryInstructions`, and
   `X402_AUTHORIZATION_ARG_DESCRIPTION`.
 - **`server/payment-log` is now rail-agnostic.** `inspectMpxAuthorization` reads
@@ -31,10 +31,10 @@ protocol change bumps that field and the package major.
   `logger: PaymentLogger` that receives typed `PaymentLogEvent`s. The default is
   a no-op (a library must not write to a host's console). `consolePaymentLogger`
   restores the previous verbose console output.
-- **`dev-signature` reference rail** (`@overdraft/mcp-payments/rails/dev-signature`).
+- **`dev-signature` reference rail** (`@overdraft-protocol/mpx/rails/dev-signature`).
   A zero-dependency HMAC rail for local development, demos, and CI — and the
   canonical template for writing a new rail.
-- **`stripe-card` rail** (`@overdraft/mcp-payments/rails/stripe`). A production
+- **`stripe-card` rail** (`@overdraft-protocol/mpx/rails/stripe`). A production
   card rail (Stripe PaymentIntent with manual capture) proving the core is
   rail-agnostic beyond crypto. `stripe` is an optional peer dependency.
 - **`PaymentRail.buildOffer` may now be async** (`RailOffer | Promise<RailOffer>`),

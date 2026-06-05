@@ -1,5 +1,5 @@
 {
-  "name": "@overdraft/mcp-payments",
+  "name": "@overdraft/mpx",
   "version": "0.1.0",
   "description": "Transport-safe, in-band payment extension for MCP servers. Rail-agnostic core with pluggable settlement rails.",
   "license": "MIT",
@@ -14,16 +14,18 @@
     "ai-agents",
     "stablecoin",
     "usdc",
-    "json-rpc"
+    "json-rpc",
+    "mpx",
+    "mcp-payments",
+    "mcp-payment-extension"
   ],
-  "homepage": "https://github.com/overdraft-protocol/overdraft-marketplace/tree/main/packages/mcp-payments#readme",
+  "homepage": "https://github.com/overdraft-protocol/mcp-payments#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/overdraft-protocol/overdraft-marketplace.git",
-    "directory": "packages/mcp-payments"
+    "url": "git+https://github.com/overdraft-protocol/mcp-payments.git"
   },
   "bugs": {
-    "url": "https://github.com/overdraft-protocol/overdraft-marketplace/issues"
+    "url": "https://github.com/overdraft-protocol/mcp-payments/issues"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

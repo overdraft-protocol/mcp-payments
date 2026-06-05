@@ -1,4 +1,4 @@
-// Boundary enforcement for @overdraft/mcp-payments.
+// Boundary enforcement for @overdraft-protocol/mpx.
 //
 // This package must never import from the marketplace application (src/).
 // The tsconfig already enforces this structurally (no @/ alias), but ESLint

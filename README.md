@@ -1,4 +1,4 @@
-# @overdraft/mcp-payments
+# @overdraft-protocol/mpx
 
 A transport-safe, in-band payment extension for MCP servers.
 
@@ -110,7 +110,7 @@ for a detailed analysis of why elicitation is not yet feasible.
 ## Installation
 
 ```bash
-npm install @overdraft/mcp-payments
+npm install @overdraft-protocol/mpx
 ```
 
 The x402-evm rail additionally requires `x402` and `viem` as peer dependencies:
@@ -124,9 +124,9 @@ npm install x402 viem
 ### 1. Create the extension
 
 ```ts
-import { createPaymentExtension, InMemoryChallengeStore } from '@overdraft/mcp-payments';
+import { createPaymentExtension, InMemoryChallengeStore } from '@overdraft-protocol/mpx';
 
-import { consolePaymentLogger } from '@overdraft/mcp-payments';
+import { consolePaymentLogger } from '@overdraft-protocol/mpx';
 
 const withPayment = createPaymentExtension({
   rails: [myRail],           // PaymentRail[] — see Implementing a rail below
@@ -214,8 +214,8 @@ Return `null` from `intent()` to skip payment for calls that don't require it:
 A `PaymentRail` has two **required** responsibilities: building the offer shown in the challenge, and verifying a signed authorization. It never settles — settlement is an injected `SettlementStrategy`. The core is fully rail-agnostic: it knows nothing about x402, EVM, cards, or any specific scheme.
 
 ```ts
-import type { PaymentRail, PaymentIntent, VerifiedAuthorization } from '@overdraft/mcp-payments';
-import type { RailOffer } from '@overdraft/mcp-payments';
+import type { PaymentRail, PaymentIntent, VerifiedAuthorization } from '@overdraft-protocol/mpx';
+import type { RailOffer } from '@overdraft-protocol/mpx';
 
 const myRail: PaymentRail = {
   id: 'my-rail',
@@ -263,10 +263,10 @@ Three rails ship with the package: [`dev-signature`](#dev-signature-reference--d
 
 ### `dev-signature` (reference / dev / CI)
 
-A zero-dependency rail at `@overdraft/mcp-payments/rails/dev-signature`. "Authorization" is an HMAC-SHA256 over the offer terms with a shared secret, standing in for a wallet signature. It moves no real funds — use it for local development, demos, CI, and as the template for a real rail.
+A zero-dependency rail at `@overdraft-protocol/mpx/rails/dev-signature`. "Authorization" is an HMAC-SHA256 over the offer terms with a shared secret, standing in for a wallet signature. It moves no real funds — use it for local development, demos, CI, and as the template for a real rail.
 
 ```ts
-import { createDevSignatureRail, signDevAuthorization } from '@overdraft/mcp-payments/rails/dev-signature';
+import { createDevSignatureRail, signDevAuthorization } from '@overdraft-protocol/mpx/rails/dev-signature';
 
 const rail = createDevSignatureRail({ secret: process.env.DEV_PAY_SECRET! });
 // A payer signs an offer with: signDevAuthorization(secret, challenge.accepts[0])
@@ -275,7 +275,7 @@ const rail = createDevSignatureRail({ secret: process.env.DEV_PAY_SECRET! });
 ## Implementing a SettlementStrategy
 
 ```ts
-import type { SettlementStrategy, VerifiedAuthorization, SettlementRef } from '@overdraft/mcp-payments';
+import type { SettlementStrategy, VerifiedAuthorization, SettlementRef } from '@overdraft-protocol/mpx';
 
 const mySettlement: SettlementStrategy = {
   async settle(verified: VerifiedAuthorization, binding: unknown): Promise<SettlementRef> {
@@ -293,7 +293,7 @@ The `binding` parameter is exactly what you returned in `intent()`. The package 
 The default `InMemoryChallengeStore` is suitable for single-process servers and tests. For production, implement `ChallengeStore` backed by a database:
 
 ```ts
-import type { ChallengeStore, ChallengeRecord } from '@overdraft/mcp-payments';
+import type { ChallengeStore, ChallengeRecord } from '@overdraft-protocol/mpx';
 
 class MyDurableChallengeStore implements ChallengeStore {
   async save(record: ChallengeRecord): Promise<void> {
@@ -329,10 +329,10 @@ class MyDurableChallengeStore implements ChallengeStore {
 
 ### x402-evm-exact (production EVM stablecoins)
 
-A generic x402 EVM rail at the `@overdraft/mcp-payments/rails/x402-evm` subpath. It requires `x402` and `viem` as peer dependencies, imported dynamically inside `verify()` so the core compiles and runs without them when this rail isn't used.
+A generic x402 EVM rail at the `@overdraft-protocol/mpx/rails/x402-evm` subpath. It requires `x402` and `viem` as peer dependencies, imported dynamically inside `verify()` so the core compiles and runs without them when this rail isn't used.
 
 ```ts
-import { createX402EvmRail } from '@overdraft/mcp-payments/rails/x402-evm';
+import { createX402EvmRail } from '@overdraft-protocol/mpx/rails/x402-evm';
 import { createPublicClient, http } from 'viem';
 import { base } from 'viem/chains';
 
@@ -353,10 +353,10 @@ This rail handles `buildOffer` (constructs x402 `PaymentRequirements`) and `veri
 
 ### `stripe-card` (production cards)
 
-A card rail at `@overdraft/mcp-payments/rails/stripe`, proving the core works for traditional payments, not just crypto. `stripe` is an optional peer dependency, imported dynamically only when you pass a `secretKey` (inject a `stripe` client directly for tests).
+A card rail at `@overdraft-protocol/mpx/rails/stripe`, proving the core works for traditional payments, not just crypto. `stripe` is an optional peer dependency, imported dynamically only when you pass a `secretKey` (inject a `stripe` client directly for tests).
 
 ```ts
-import { createStripeRail } from '@overdraft/mcp-payments/rails/stripe';
+import { createStripeRail } from '@overdraft-protocol/mpx/rails/stripe';
 
 const rail = createStripeRail({
   secretKey: process.env.STRIPE_SECRET_KEY!,  // or: stripe: new Stripe(key)
@@ -393,7 +393,7 @@ Settlement stays **injected** into `createPaymentExtension` — the core never m
 | `stripe-card` | `confirmStripePaymentIntent(stripe, offer, { paymentMethod })` | `createStripeCaptureSettlement(stripe)` — captures the hold |
 
 ```ts
-import { createStripeRail, createStripeCaptureSettlement } from '@overdraft/mcp-payments/rails/stripe';
+import { createStripeRail, createStripeCaptureSettlement } from '@overdraft-protocol/mpx/rails/stripe';
 
 const stripe = new Stripe(key);
 const withPayment = createPaymentExtension({
@@ -424,7 +424,7 @@ Swapping in a real rail is the same wiring: replace the rail + settlement with `
 The core never writes to `console` — it emits structured `PaymentLogEvent`s to an injected `PaymentLogger`:
 
 ```ts
-import { createPaymentExtension, consolePaymentLogger, type PaymentLogger } from '@overdraft/mcp-payments';
+import { createPaymentExtension, consolePaymentLogger, type PaymentLogger } from '@overdraft-protocol/mpx';
 
 // Built-ins: noopPaymentLogger (default), consolePaymentLogger.
 // Or forward to your own structured logger:

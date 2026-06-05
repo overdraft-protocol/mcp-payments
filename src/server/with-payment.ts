@@ -66,7 +66,7 @@ export interface PaymentExtensionConfig {
   /**
    * Structured lifecycle logger. Default is a no-op — a library must not write
    * to console for its host. Pass `consolePaymentLogger` (from
-   * '@overdraft/mcp-payments') for verbose console output, or your own sink.
+   * '@overdraft-protocol/mpx') for verbose console output, or your own sink.
    */
   logger?: PaymentLogger;
 }
