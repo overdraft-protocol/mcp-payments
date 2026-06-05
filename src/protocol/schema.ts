@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import { MPP_VERSION } from './meta.js';
+import { MPX_VERSION } from './meta.js';
 
 // ── Shared primitives ────────────────────────────────────────────────────────
 
-export const MppAmountSchema = z.object({
+export const MpxAmountSchema = z.object({
   /** Decimal string, e.g. "1.50". Never a float. */
   value: z.string().regex(/^\d+(\.\d+)?$/, 'amount value must be a decimal string'),
   /** ISO 4217 or well-known crypto ticker, e.g. "USDC". */
@@ -11,7 +11,7 @@ export const MppAmountSchema = z.object({
   /** Exponent: 10^-decimals gives the smallest unit, e.g. 6 for USDC. */
   decimals: z.number().int().nonnegative(),
 });
-export type MppAmount = z.infer<typeof MppAmountSchema>;
+export type MpxAmount = z.infer<typeof MpxAmountSchema>;
 
 // ── Rail offer (one entry in challenge.accepts) ──────────────────────────────
 
@@ -28,10 +28,10 @@ export const RailOfferSchema = z.object({
 });
 export type RailOffer = z.infer<typeof RailOfferSchema>;
 
-// ── Challenge — result._meta["mcp-payments/v1.challenge"] ───────────────────
+// ── Challenge — result._meta["mpx/v1.challenge"] ───────────────────
 
-export const MppChallengeSchema = z.object({
-  mppVersion: z.literal(MPP_VERSION),
+export const MpxChallengeSchema = z.object({
+  mpxVersion: z.literal(MPX_VERSION),
   /** Opaque ID correlating this challenge with the authorization and receipt. */
   paymentRequestId: z.string().uuid(),
   /** ISO-8601 expiry — the server will reject authorizations after this time. */
@@ -42,16 +42,16 @@ export const MppChallengeSchema = z.object({
     /** Human/agent-readable description of the payment purpose. */
     description: z.string().min(1),
   }),
-  amount: MppAmountSchema,
+  amount: MpxAmountSchema,
   /** Ordered list of payment rails the server accepts; payer picks one. */
   accepts: z.array(RailOfferSchema).min(1),
 });
-export type MppChallenge = z.infer<typeof MppChallengeSchema>;
+export type MpxChallenge = z.infer<typeof MpxChallengeSchema>;
 
-// ── Authorization — params._meta["mcp-payments/v1.authorization"] ───────────
+// ── Authorization — params._meta["mpx/v1.authorization"] ───────────
 
-export const MppAuthorizationSchema = z.object({
-  mppVersion: z.literal(MPP_VERSION),
+export const MpxAuthorizationSchema = z.object({
+  mpxVersion: z.literal(MPX_VERSION),
   /** Must echo the paymentRequestId from the challenge. */
   paymentRequestId: z.string().uuid(),
   /** Which rail the payer chose from challenge.accepts. */
@@ -62,12 +62,12 @@ export const MppAuthorizationSchema = z.object({
    */
   payload: z.unknown(),
 });
-export type MppAuthorization = z.infer<typeof MppAuthorizationSchema>;
+export type MpxAuthorization = z.infer<typeof MpxAuthorizationSchema>;
 
-// ── Receipt — result._meta["mcp-payments/v1.receipt"] ───────────────────────
+// ── Receipt — result._meta["mpx/v1.receipt"] ───────────────────────
 
-export const MppReceiptSchema = z.object({
-  mppVersion: z.literal(MPP_VERSION),
+export const MpxReceiptSchema = z.object({
+  mpxVersion: z.literal(MPX_VERSION),
   paymentRequestId: z.string().uuid(),
   rail: z.string().min(1),
   /**
@@ -75,7 +75,7 @@ export const MppReceiptSchema = z.object({
    * For x402-evm-exact this is a transaction hash.
    */
   settlementRef: z.string().min(1),
-  amount: MppAmountSchema,
+  amount: MpxAmountSchema,
   settledAt: z.string().datetime(),
 });
-export type MppReceipt = z.infer<typeof MppReceiptSchema>;
+export type MpxReceipt = z.infer<typeof MpxReceiptSchema>;

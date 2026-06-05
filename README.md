@@ -2,11 +2,11 @@
 
 A transport-safe, in-band payment extension for MCP servers.
 
-Standard MCP payment approaches using HTTP headers (e.g. x402's `X-PAYMENT-REQUIRED`) are invisible to agents: the MCP client transport swallows non-2xx HTTP responses before the JSON-RPC layer and never exposes arbitrary response headers to the model. This package implements the **MCP Payment Profile (MPP)** — a payment handshake that lives entirely inside JSON-RPC message bodies, works identically over stdio and Streamable HTTP, and is visible to any MCP-capable agent.
+Standard MCP payment approaches using HTTP headers (e.g. x402's `X-PAYMENT-REQUIRED`) are invisible to agents: the MCP client transport swallows non-2xx HTTP responses before the JSON-RPC layer and never exposes arbitrary response headers to the model. This package implements the **MCP Payments Extension (MPX)** — a payment handshake that lives entirely inside JSON-RPC message bodies, works identically over stdio and Streamable HTTP, and is visible to any MCP-capable agent.
 
 ## The protocol
 
-All payment signaling travels in `_meta` fields on JSON-RPC messages, using the reserved namespace `mcp-payments/v1.*`. No HTTP headers or status codes are used.
+All payment signaling travels in `_meta` fields on JSON-RPC messages, using the reserved namespace `mpx/v1.*`. No HTTP headers or status codes are used.
 
 ### 1. Challenge (server → agent)
 
@@ -17,8 +17,8 @@ When a tool is called without a valid payment authorization, the server returns 
   "isError": true,
   "content": [{ "type": "text", "text": "payment_required: ... (1.50 USDC). Retry with _meta authorization." }],
   "_meta": {
-    "mcp-payments/v1.challenge": {
-      "mppVersion": 1,
+    "mpx/v1.challenge": {
+      "mpxVersion": 1,
       "paymentRequestId": "<uuid>",
       "expiresAt": "<ISO-8601>",
       "reason": { "tool": "<tool-name>", "description": "<human-readable purpose>" },
@@ -48,8 +48,8 @@ The agent re-issues the **same** `tools/call` (identical arguments) and adds the
     "name": "<tool>",
     "arguments": { "...": "unchanged" },
     "_meta": {
-      "mcp-payments/v1.authorization": {
-        "mppVersion": 1,
+      "mpx/v1.authorization": {
+        "mpxVersion": 1,
         "paymentRequestId": "<uuid from challenge>",
         "rail": "x402-evm-exact",
         "payload": { "...": "rail-specific signed payload" }
@@ -66,8 +66,8 @@ On success, the result carries a receipt in `result._meta`:
 ```json
 {
   "_meta": {
-    "mcp-payments/v1.receipt": {
-      "mppVersion": 1,
+    "mpx/v1.receipt": {
+      "mpxVersion": 1,
       "paymentRequestId": "<uuid>",
       "rail": "x402-evm-exact",
       "settlementRef": "<rail-specific reference>",
@@ -103,9 +103,9 @@ LLM can see and react to them.
 `PaymentAuthorizationRequired` error code is added to the SDK (following the same
 carve-out as `UrlElicitationRequired`), `withPayment` can be updated to throw it
 instead of returning an `isError` result. No tool handler or marketplace wiring
-changes — the switch is entirely inside the wrapper. See
-[`docs/mcp-payment-protocol.md` § 9](../../docs/mcp-payment-protocol.md) for a
-detailed analysis of why elicitation is not yet feasible.
+changes — the switch is entirely inside the wrapper. See the [protocol design
+notes](https://github.com/overdraft-protocol/overdraft-marketplace/blob/main/docs/mcp-payment-protocol.md)
+for a detailed analysis of why elicitation is not yet feasible.
 
 ## Installation
 
@@ -126,11 +126,14 @@ npm install x402 viem
 ```ts
 import { createPaymentExtension, InMemoryChallengeStore } from '@overdraft/mcp-payments';
 
+import { consolePaymentLogger } from '@overdraft/mcp-payments';
+
 const withPayment = createPaymentExtension({
   rails: [myRail],           // PaymentRail[] — see Implementing a rail below
   store: new InMemoryChallengeStore(),  // or your durable ChallengeStore
   settlement: mySettlement,  // SettlementStrategy — what "settle" does in your app
   challengeTtlSeconds: 300,  // optional, default 300
+  logger: consolePaymentLogger, // optional, default no-op — see Logging below
 });
 ```
 
@@ -172,7 +175,7 @@ server.registerTool(
 Standard LLM harnesses only let the model control `arguments` — `params._meta` is populated by the client host. `withPayment` automatically checks `args.payment_authorization` if `_meta` does not contain an authorization. The value must be a JSON string of the authorization object, or the object itself:
 
 ```json
-{ "arguments": { "..": "..", "payment_authorization": "{\"mppVersion\":1,\"paymentRequestId\":\"...\",\"rail\":\"x402-evm-exact\",\"payload\":{...}}" } }
+{ "arguments": { "..": "..", "payment_authorization": "{\"mpxVersion\":1,\"paymentRequestId\":\"...\",\"rail\":\"x402-evm-exact\",\"payload\":{...}}" } }
 ```
 
 To make `payment_authorization` reachable in the handler (Zod strips unknown fields), declare it in the tool's `inputSchema`:
@@ -181,7 +184,7 @@ To make `payment_authorization` reachable in the handler (Zod strips unknown fie
 inputSchema: {
   amount_usdc: z.number(),
   payment_authorization: z.string().optional().describe(
-    'JSON-encoded MPP authorization. Alternative to params._meta["mcp-payments/v1.authorization"].'
+    'JSON-encoded MPX authorization. Alternative to params._meta["mpx/v1.authorization"].'
   ),
 }
 ```
@@ -208,7 +211,7 @@ Return `null` from `intent()` to skip payment for calls that don't require it:
 
 ## Implementing a rail
 
-A `PaymentRail` has two responsibilities: building the offer shown in the challenge, and verifying a signed authorization. It never settles — settlement is an injected `SettlementStrategy`.
+A `PaymentRail` has two **required** responsibilities: building the offer shown in the challenge, and verifying a signed authorization. It never settles — settlement is an injected `SettlementStrategy`. The core is fully rail-agnostic: it knows nothing about x402, EVM, cards, or any specific scheme.
 
 ```ts
 import type { PaymentRail, PaymentIntent, VerifiedAuthorization } from '@overdraft/mcp-payments';
@@ -239,6 +242,34 @@ const myRail: PaymentRail = {
     };
   },
 };
+```
+
+### Optional rail hooks (agent ergonomics)
+
+A rail can own its agent-facing details so they never leak into the core. All are optional — a rail that omits them still works, falling back to generic behaviour.
+
+| Hook | Purpose |
+|---|---|
+| `coerceAuthorization(raw, hints)` | Normalize loosely-shaped agent input (the common case: a JSON blob in a `payment_authorization` argument because the harness can't write `params._meta`) into a schema-valid MPX authorization. The core tries each rail's coercer in order and keeps the first result that validates. |
+| `retryInstructions(challenge)` | Rail-specific "how to pay" text appended to the challenge content. |
+| `describePayload(payload)` | Redact a signed payload to a safe summary for the structured logger (never log secrets/signatures in full). |
+| `authorizationArgDescription` | Description for the `payment_authorization` tool argument, surfaced by apps in their `inputSchema`. |
+
+The cleanest reference implementation of all of these is the **`dev-signature` rail** ([`src/rails/dev-signature/index.ts`](src/rails/dev-signature/index.ts)) — it's zero-dependency and self-contained; copy it as a starting point.
+
+## Bundled rails
+
+Three rails ship with the package: [`dev-signature`](#dev-signature-reference--dev--ci) (zero-dependency, for dev/CI/reference), [`x402-evm-exact`](#x402-evm-exact-production-evm-stablecoins) (EVM stablecoin payments), and [`stripe-card`](#stripe-card-production-cards) (card payments via Stripe) — proof the core is rail-agnostic across both crypto and traditional rails.
+
+### `dev-signature` (reference / dev / CI)
+
+A zero-dependency rail at `@overdraft/mcp-payments/rails/dev-signature`. "Authorization" is an HMAC-SHA256 over the offer terms with a shared secret, standing in for a wallet signature. It moves no real funds — use it for local development, demos, CI, and as the template for a real rail.
+
+```ts
+import { createDevSignatureRail, signDevAuthorization } from '@overdraft/mcp-payments/rails/dev-signature';
+
+const rail = createDevSignatureRail({ secret: process.env.DEV_PAY_SECRET! });
+// A payer signs an offer with: signDevAuthorization(secret, challenge.accepts[0])
 ```
 
 ## Implementing a SettlementStrategy
@@ -296,9 +327,9 @@ class MyDurableChallengeStore implements ChallengeStore {
 }
 ```
 
-## x402-evm-exact rail
+### x402-evm-exact (production EVM stablecoins)
 
-The package ships a generic x402 EVM rail at the `@overdraft/mcp-payments/rails/x402-evm` subpath. It requires `x402` and `viem` as peer dependencies.
+A generic x402 EVM rail at the `@overdraft/mcp-payments/rails/x402-evm` subpath. It requires `x402` and `viem` as peer dependencies, imported dynamically inside `verify()` so the core compiles and runs without them when this rail isn't used.
 
 ```ts
 import { createX402EvmRail } from '@overdraft/mcp-payments/rails/x402-evm';
@@ -309,12 +340,102 @@ const rail = createX402EvmRail({
   publicClient: createPublicClient({ chain: base, transport: http() }),
   assetAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',  // USDC on Base
   network: 'base',
+  chainId: 8453,        // optional — included in offers for EIP-712 wallets
   currencySymbol: 'USDC',
   decimals: 6,
+  // Optional EIP-712 token metadata (defaults shown — for USDC):
+  assetName: 'USD Coin',
+  assetVersion: '2',
 });
 ```
 
-This rail handles `buildOffer` (constructs x402 `PaymentRequirements`) and `verify` (`exact.evm.verify` — no on-chain action). Settlement is always injected: the rail has no `depositBid`, no `Escrow.sol`, no application knowledge.
+This rail handles `buildOffer` (constructs x402 `PaymentRequirements`) and `verify` (`exact.evm.verify` — no on-chain action). It also wires the optional hooks (`coerceAuthorization`, `retryInstructions`, `describePayload`, `authorizationArgDescription`), exported individually as `coerceX402Authorization`, `x402RetryInstructions`, and `X402_AUTHORIZATION_ARG_DESCRIPTION`. Settlement is always injected: the rail has no `depositBid`, no `Escrow.sol`, no application knowledge.
+
+### `stripe-card` (production cards)
+
+A card rail at `@overdraft/mcp-payments/rails/stripe`, proving the core works for traditional payments, not just crypto. `stripe` is an optional peer dependency, imported dynamically only when you pass a `secretKey` (inject a `stripe` client directly for tests).
+
+```ts
+import { createStripeRail } from '@overdraft/mcp-payments/rails/stripe';
+
+const rail = createStripeRail({
+  secretKey: process.env.STRIPE_SECRET_KEY!,  // or: stripe: new Stripe(key)
+  currency: 'usd',
+  publishableKey: process.env.STRIPE_PUBLISHABLE_KEY, // optional, for client confirmation
+});
+```
+
+It maps cleanly onto the small rail interface, and shows the two enhancements that make non-crypto rails possible:
+
+1. **`buildOffer(intent)` is async** — it creates a Stripe PaymentIntent (`capture_method: 'manual'`) and returns its `id` + `client_secret` in `requirements`. (`buildOffer` may return a promise; the core awaits it.)
+2. **`verify(payload, offer)`** — `payload` carries the confirmed PaymentIntent id; the rail retrieves it and asserts `status === 'requires_capture'` and that amount/currency match the offer. **No money moves** — an uncaptured authorization is just a hold.
+3. **Settlement stays injected** — your `SettlementStrategy.settle()` calls `stripe.paymentIntents.capture(id)`. This is what preserves *verify-before-settle*: the hold is verified before the handler runs, capture happens only after the handler validates and calls `extra.settle()`.
+4. **Optional hooks** are wired: `coerceAuthorization` accepts `{ paymentRequestId, paymentIntentId }` shorthand; `retryInstructions` tells the agent how to confirm the PaymentIntent; `describePayload` logs only the id.
+
+The single invariant every rail must uphold: **`verify()` proves funds are committed but moves nothing; only the injected `settle()` moves money.** Everything else is rail-specific.
+
+**Try it against Stripe test mode** — [`examples/stripe-integration.ts`](examples/stripe-integration.ts) runs the whole loop (create → confirm with a test card → verify → capture) against real Stripe test APIs:
+
+```bash
+npm i stripe
+export STRIPE_SECRET_KEY=sk_test_...   # test mode only; the script refuses live keys
+npx tsx examples/stripe-integration.ts
+```
+
+## Confirmation & settlement helpers
+
+Settlement stays **injected** into `createPaymentExtension` — the core never moves money itself, and apps with bespoke settlement (escrow, ledgers, the marketplace) implement `SettlementStrategy` directly. But for the common cases you don't have to write it: each rail ships an opt-in **settlement strategy** and a **payer-side helper** (signing/confirming an offer), so both ends are batteries-included.
+
+| Rail | Payer helper (client side) | Settlement strategy (server side) |
+|---|---|---|
+| `dev-signature` | `signDevAuthorization(secret, offer)` | `devSignatureSettlement` (no-op) |
+| `x402-evm-exact` | `signX402Authorization({ account, offer })` | `createX402TransferSettlement({ wallet })` — bare USDC transfer via `exact.evm.settle` |
+| `stripe-card` | `confirmStripePaymentIntent(stripe, offer, { paymentMethod })` | `createStripeCaptureSettlement(stripe)` — captures the hold |
+
+```ts
+import { createStripeRail, createStripeCaptureSettlement } from '@overdraft/mcp-payments/rails/stripe';
+
+const stripe = new Stripe(key);
+const withPayment = createPaymentExtension({
+  rails: [createStripeRail({ stripe, currency: 'usd' })],
+  store,
+  settlement: createStripeCaptureSettlement(stripe),  // ← shipped, no custom code
+});
+```
+
+Settlement strategies that need the original offer (e.g. x402 needs the verified `PaymentRequirements`) receive it via the third `settle(verified, binding, context)` argument — `context.offer`. The argument is additive: existing two-parameter strategies keep working unchanged.
+
+## Example server
+
+[`examples/stdio-server.ts`](examples/stdio-server.ts) is a minimal MCP server with one paid tool, using the zero-dependency `dev-signature` rail — no chain, keys, or network. Run it as a real stdio server, or self-contained:
+
+```bash
+# real stdio MCP server (connect any MCP client / inspector):
+npx tsx examples/stdio-server.ts
+
+# self-contained demo — drives itself and prints challenge → sign → pay → receipt:
+npx tsx examples/stdio-server.ts --demo
+```
+
+Swapping in a real rail is the same wiring: replace the rail + settlement with `createX402EvmRail`/`createX402TransferSettlement` or `createStripeRail`/`createStripeCaptureSettlement`.
+
+## Logging
+
+The core never writes to `console` — it emits structured `PaymentLogEvent`s to an injected `PaymentLogger`:
+
+```ts
+import { createPaymentExtension, consolePaymentLogger, type PaymentLogger } from '@overdraft/mcp-payments';
+
+// Built-ins: noopPaymentLogger (default), consolePaymentLogger.
+// Or forward to your own structured logger:
+const logger: PaymentLogger = {
+  log(event) { myLogger.info({ mcpPayment: event }); },
+};
+
+const withPayment = createPaymentExtension({ rails, store, settlement, logger });
+```
+
+Event `type`s: `challenge_issued`, `authorization_received`, `authorization_parse_failed`, `verify_started`, `verify_succeeded`, `verify_failed`, `challenge_not_found`, `settled`. Payload fields are redacted by the rail's `describePayload` — the core never logs raw signatures.
 
 ## API
 
@@ -328,6 +449,7 @@ Returns a `withPayment(spec, handler)` function. Config:
 | `store` | `ChallengeStore` | Challenge persistence (use `InMemoryChallengeStore` for dev/tests) |
 | `settlement` | `SettlementStrategy` | What `settle()` does — injected by the application |
 | `challengeTtlSeconds` | `number?` | Challenge TTL in seconds (default: 300) |
+| `logger` | `PaymentLogger?` | Structured event sink (default: no-op). See [Logging](#logging) |
 
 ### `withPayment(spec, handler)`
 
@@ -352,7 +474,7 @@ The `handler` receives `(args, extra)` where `extra` is augmented with:
 
 | Field | Type | Description |
 |---|---|---|
-| `amount` | `MppAmount` | `{ value, currency, decimals }` |
+| `amount` | `MpxAmount` | `{ value, currency, decimals }` |
 | `payTo` | `string` | Payee address/account |
 | `binding` | `unknown` | App-specific data passed unchanged to `SettlementStrategy.settle()` |
 | `railHints` | `Record<string, unknown>?` | Opaque hints forwarded to `rail.buildOffer()` |

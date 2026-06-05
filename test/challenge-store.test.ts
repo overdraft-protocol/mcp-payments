@@ -2,12 +2,12 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { InMemoryChallengeStore } from '../src/server/challenge-store.js';
 import type { ChallengeRecord } from '../src/server/challenge-store.js';
-import { MPP_VERSION } from '../src/protocol/meta.js';
+import { MPX_VERSION } from '../src/protocol/meta.js';
 
 function makeRecord(ttlMs = 60_000): ChallengeRecord {
   return {
     challenge: {
-      mppVersion: MPP_VERSION,
+      mpxVersion: MPX_VERSION,
       paymentRequestId: crypto.randomUUID(),
       expiresAt: new Date(Date.now() + ttlMs).toISOString(),
       reason: { tool: 'test_tool', description: 'Test payment' },

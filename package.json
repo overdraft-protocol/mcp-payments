@@ -2,7 +2,29 @@
   "name": "@overdraft/mcp-payments",
   "version": "0.1.0",
   "description": "Transport-safe, in-band payment extension for MCP servers. Rail-agnostic core with pluggable settlement rails.",
+  "license": "MIT",
+  "author": "Overdraft",
   "type": "module",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "payments",
+    "x402",
+    "agents",
+    "ai-agents",
+    "stablecoin",
+    "usdc",
+    "json-rpc"
+  ],
+  "homepage": "https://github.com/overdraft-protocol/overdraft-marketplace/tree/main/packages/mcp-payments#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/overdraft-protocol/overdraft-marketplace.git",
+    "directory": "packages/mcp-payments"
+  },
+  "bugs": {
+    "url": "https://github.com/overdraft-protocol/overdraft-marketplace/issues"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -14,9 +36,13 @@
       "import": "./dist/rails/x402-evm/index.js",
       "types": "./dist/rails/x402-evm/index.d.ts"
     },
-    "./server/authorization-shape": {
-      "import": "./dist/server/authorization-shape.js",
-      "types": "./dist/server/authorization-shape.d.ts"
+    "./rails/dev-signature": {
+      "import": "./dist/rails/dev-signature/index.js",
+      "types": "./dist/rails/dev-signature/index.d.ts"
+    },
+    "./rails/stripe": {
+      "import": "./dist/rails/stripe/index.js",
+      "types": "./dist/rails/stripe/index.d.ts"
     },
     "./server/payment-log": {
       "import": "./dist/server/payment-log.js",
@@ -26,7 +52,9 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/**/*.test.ts"
+    "lint": "eslint .",
+    "test": "tsx --test test/**/*.test.ts",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -34,19 +62,31 @@
   },
   "peerDependencies": {
     "x402": "^1.2.0",
-    "viem": "^2.30.0"
+    "viem": "^2.30.0",
+    "stripe": "^17.0.0"
   },
   "peerDependenciesMeta": {
     "x402": { "optional": true },
-    "viem": { "optional": true }
+    "viem": { "optional": true },
+    "stripe": { "optional": true }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
     "tsup": "^8.5.1",
-    "typescript": "^5.8.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.0.0"
   },
   "files": [
     "dist",
-    "src"
-  ]
+    "src",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }

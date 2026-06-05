@@ -1,4 +1,4 @@
-import type { MppChallenge, RailOffer } from '../protocol/schema.js';
+import type { MpxChallenge, RailOffer } from '../protocol/schema.js';
 import type { PaymentIntent } from '../rails/rail.js';
 
 /**
@@ -6,7 +6,7 @@ import type { PaymentIntent } from '../rails/rail.js';
  * authorization and produce a settlement binding.
  */
 export interface ChallengeRecord {
-  challenge: MppChallenge;
+  challenge: MpxChallenge;
   /** The original PaymentIntent, kept so the app's binding survives the round-trip. */
   intent: PaymentIntent;
   /** Per-rail offers indexed by rail id — the authoritative copy for verify(). */

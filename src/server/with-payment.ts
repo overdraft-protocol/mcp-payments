@@ -1,23 +1,14 @@
 import { randomUUID } from 'crypto';
-import { META_KEYS, MPP_VERSION } from '../protocol/meta.js';
+import { META_KEYS, MPX_VERSION } from '../protocol/meta.js';
 import {
-  MppAuthorizationSchema,
-  MppChallengeSchema,
-  type MppChallenge,
-  type MppReceipt,
+  MpxAuthorizationSchema,
+  MpxChallengeSchema,
+  type MpxChallenge,
+  type MpxReceipt,
 } from '../protocol/schema.js';
 import type { PaymentRail, PaymentIntent, VerifiedAuthorization, SettlementStrategy, SettlementRef } from '../rails/rail.js';
 import type { ChallengeStore } from './challenge-store.js';
-import {
-  inspectMppAuthorization,
-  logPaymentAuthParseFailed,
-  logPaymentAuthReceived,
-  logPaymentChallenge,
-  logPaymentVerifyFailed,
-  logPaymentVerifyOk,
-  logPaymentVerifyStart,
-} from './payment-log.js';
-import { coerceAgentPaymentAuthorization, paymentRetryInstructions } from './authorization-shape.js';
+import { noopPaymentLogger, type PaymentLogger } from './logger.js';
 
 // ── PaymentSpec — supplied by the application (Layer C) ──────────────────────
 
@@ -72,11 +63,30 @@ export interface PaymentExtensionConfig {
   settlement: SettlementStrategy;
   /** TTL for issued challenges in seconds. Default: 300 (5 minutes). */
   challengeTtlSeconds?: number;
+  /**
+   * Structured lifecycle logger. Default is a no-op — a library must not write
+   * to console for its host. Pass `consolePaymentLogger` (from
+   * '@overdraft/mcp-payments') for verbose console output, or your own sink.
+   */
+  logger?: PaymentLogger;
 }
 
 // ── Result helpers ────────────────────────────────────────────────────────────
 
-function challengeResult(challenge: MppChallenge) {
+/** Fallback when the chosen rail provides no retryInstructions of its own. */
+function genericRetryInstructions(challenge: MpxChallenge): string {
+  return [
+    '',
+    'HOW TO PAY:',
+    `  1. Sign the requirements in accepts[0] (rail "${challenge.accepts[0].rail}") with your wallet.`,
+    '  2. Retry this exact tool call with identical arguments, adding the signed',
+    `     authorization under params._meta["${META_KEYS.authorization}"] (or the`,
+    '     payment_authorization argument) referencing this paymentRequestId:',
+    `     ${challenge.paymentRequestId}`,
+  ].join('\n');
+}
+
+function challengeResult(challenge: MpxChallenge, instructions: string) {
   // The full challenge is emitted in the text content (not only result._meta)
   // because standard LLM harnesses surface a tool result's `content` to the
   // model but not its `_meta`. An agent that cannot read `_meta` still needs
@@ -89,7 +99,7 @@ function challengeResult(challenge: MppChallenge) {
     'Payment challenge (sign this via your wallet MCP server, then retry the same tool call):',
     JSON.stringify(challenge, null, 2),
     '',
-    paymentRetryInstructions(challenge),
+    instructions,
   ].join('\n');
 
   return {
@@ -106,7 +116,7 @@ function challengeResult(challenge: MppChallenge) {
   };
 }
 
-function attachReceipt<T extends object>(result: T, receipt: MppReceipt): T & { _meta: Record<string, unknown> } {
+function attachReceipt<T extends object>(result: T, receipt: MpxReceipt): T & { _meta: Record<string, unknown> } {
   const existing = (result as Record<string, unknown>)._meta as Record<string, unknown> | undefined;
 
   // Like the challenge, the receipt is also surfaced in the content text — not
@@ -160,6 +170,26 @@ export type AnyToolHandler = (args: any, extra: any) => Promise<any>;
 export function createPaymentExtension(cfg: PaymentExtensionConfig) {
   const railMap = new Map(cfg.rails.map(r => [r.id, r]));
   const ttlMs = (cfg.challengeTtlSeconds ?? 300) * 1000;
+  const logger = cfg.logger ?? noopPaymentLogger;
+
+  /**
+   * Turn loosely-shaped agent input into an MPX authorization the schema can
+   * validate. If it already validates, use it. Otherwise let each rail attempt
+   * to normalize it (in preference order) and keep the first schema-valid
+   * result — this is how the core stays rail-agnostic while supporting each
+   * rail's own wire conventions.
+   */
+  function coerceAuthorization(raw: unknown, hints: { paymentRequestId?: string }): unknown {
+    if (raw === undefined || raw === null) return raw;
+    if (MpxAuthorizationSchema.safeParse(raw).success) return raw;
+    for (const rail of cfg.rails) {
+      const coerced = rail.coerceAuthorization?.(raw, hints);
+      if (coerced !== undefined && MpxAuthorizationSchema.safeParse(coerced).success) {
+        return coerced;
+      }
+    }
+    return raw;
+  }
 
   return function withPayment(
     spec: PaymentSpec,
@@ -203,32 +233,32 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
         : authFromArg !== undefined
           ? 'payment_authorization' as const
           : null;
-      const authRaw = coerceAgentPaymentAuthorization(authFromMeta ?? authFromArg, {
+      const authRaw = coerceAuthorization(authFromMeta ?? authFromArg, {
         paymentRequestId: typeof args.payment_request_id === 'string'
           ? args.payment_request_id
           : undefined,
       });
-      const authParsed = MppAuthorizationSchema.safeParse(authRaw);
+      const authParsed = MpxAuthorizationSchema.safeParse(authRaw);
 
       if (!authParsed.success) {
         if (authRaw !== undefined) {
-          logPaymentAuthParseFailed(
-            spec.tool,
-            authSource ?? 'unknown',
-            authRaw,
-            authParsed.error.message,
-          );
+          logger.log({
+            type: 'authorization_parse_failed',
+            tool: spec.tool,
+            source: authSource ?? 'unknown',
+            error: authParsed.error.message,
+          });
         }
         // No valid authorization — issue a challenge.
         const paymentRequestId = randomUUID();
         const expiresAt = new Date(Date.now() + ttlMs).toISOString();
 
         const offers = Object.fromEntries(
-          cfg.rails.map(r => [r.id, r.buildOffer(intent)]),
+          await Promise.all(cfg.rails.map(async r => [r.id, await r.buildOffer(intent)] as const)),
         );
 
-        const challenge = MppChallengeSchema.parse({
-          mppVersion: MPP_VERSION,
+        const challenge = MpxChallengeSchema.parse({
+          mpxVersion: MPX_VERSION,
           paymentRequestId,
           expiresAt,
           reason: { tool: spec.tool, description: spec.description },
@@ -237,27 +267,39 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
         });
 
         await cfg.store.save({ challenge, intent, offers });
-        const firstOffer = Object.values(offers)[0]?.requirements as Record<string, unknown> | undefined;
-        logPaymentChallenge(spec.tool, paymentRequestId, {
+        logger.log({
+          type: 'challenge_issued',
+          tool: spec.tool,
+          paymentRequestId,
           amount: challenge.amount,
-          expiresAt: challenge.expiresAt,
           rails: Object.keys(offers),
-          offer_network: firstOffer?.network,
-          offer_payTo: firstOffer?.payTo,
-          offer_maxAmount: firstOffer?.maxAmountRequired,
+          expiresAt: challenge.expiresAt,
         });
-        return challengeResult(challenge);
+        const firstRail = railMap.get(challenge.accepts[0].rail);
+        const instructions = firstRail?.retryInstructions?.(challenge)
+          ?? genericRetryInstructions(challenge);
+        return challengeResult(challenge, instructions);
       }
 
       const auth = authParsed.data;
-      logPaymentAuthReceived(
-        spec.tool,
-        inspectMppAuthorization(authRaw, authSource ?? 'unknown'),
-      );
+      logger.log({
+        type: 'authorization_received',
+        tool: spec.tool,
+        rail: auth.rail,
+        paymentRequestId: auth.paymentRequestId,
+        source: authSource ?? 'unknown',
+        payload: railMap.get(auth.rail)?.describePayload?.(auth.payload),
+      });
 
       // ── Step 3: load the challenge (not consumed until handler succeeds) ───
       const record = await cfg.store.get(auth.paymentRequestId);
       if (!record) {
+        logger.log({
+          type: 'challenge_not_found',
+          tool: spec.tool,
+          paymentRequestId: auth.paymentRequestId,
+          stage: 'lookup',
+        });
         return {
           isError: true as const,
           content: [{ type: 'text' as const, text: 'payment_error: challenge expired, already used, or not found. Restart the payment flow by calling the tool without authorization first.' }],
@@ -281,48 +323,48 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
         };
       }
 
-      const offerReq = offer.requirements as Record<string, unknown>;
-      logPaymentVerifyStart(spec.tool, auth, {
-        network: offerReq.network,
-        payTo: offerReq.payTo,
-        asset: offerReq.asset,
-        maxAmountRequired: offerReq.maxAmountRequired,
+      logger.log({
+        type: 'verify_started',
+        tool: spec.tool,
+        rail: auth.rail,
+        paymentRequestId: auth.paymentRequestId,
       });
 
       let verified: VerifiedAuthorization;
       try {
         verified = await rail.verify(auth.payload, offer);
       } catch (err) {
-        logPaymentVerifyFailed(spec.tool, auth.paymentRequestId, err, {
+        logger.log({
+          type: 'verify_failed',
+          tool: spec.tool,
           rail: auth.rail,
-          auth_source: authSource,
-          mpp_authorization: inspectMppAuthorization(authRaw, authSource ?? 'unknown'),
-          offer: {
-            network: offerReq.network,
-            payTo: offerReq.payTo,
-            asset: offerReq.asset,
-            maxAmountRequired: offerReq.maxAmountRequired,
-          },
+          paymentRequestId: auth.paymentRequestId,
+          error: String(err),
+          payload: rail.describePayload?.(auth.payload),
         });
-        const errStr = String(err);
-        const isSigError = errStr.includes('invalid_exact_evm_payload_signature');
-        const guidance = isSigError
-          ? ' Call the tool without payment_authorization to get a fresh challenge and follow the HOW TO PAY instructions exactly: call sign_payment_authorization with argument name "paymentRequirements" (not any other name) and pass the paymentPayload it returns.'
-          : ' You may retry with the same paymentRequestId and signed authorization.';
         return {
           isError: true as const,
-          content: [{ type: 'text' as const, text: `payment_error: authorization verification failed — ${errStr}.${guidance}` }],
+          content: [{ type: 'text' as const, text: `payment_error: authorization verification failed — ${String(err)}. You may retry with the same paymentRequestId and signed authorization, or call the tool without authorization to get a fresh challenge.` }],
         };
       }
 
-      logPaymentVerifyOk(spec.tool, auth.paymentRequestId, {
+      logger.log({
+        type: 'verify_succeeded',
+        tool: spec.tool,
         rail: verified.rail,
+        paymentRequestId: auth.paymentRequestId,
         amount: verified.amount,
       });
 
       // ── Step 5: claim the challenge before handler side effects ────────────
       const claimed = await cfg.store.consume(auth.paymentRequestId);
       if (!claimed) {
+        logger.log({
+          type: 'challenge_not_found',
+          tool: spec.tool,
+          paymentRequestId: auth.paymentRequestId,
+          stage: 'consume',
+        });
         return {
           isError: true as const,
           content: [{ type: 'text' as const, text: 'payment_error: challenge expired, already used, or not found. Restart the payment flow by calling the tool without authorization first.' }],
@@ -333,7 +375,15 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
       let settlementRef: SettlementRef | undefined;
       const settle = async (): Promise<SettlementRef> => {
         if (settlementRef) return settlementRef; // idempotent
-        settlementRef = await cfg.settlement.settle(verified, record.intent.binding);
+        settlementRef = await cfg.settlement.settle(verified, record.intent.binding, { offer });
+        logger.log({
+          type: 'settled',
+          tool: spec.tool,
+          rail: verified.rail,
+          paymentRequestId: auth.paymentRequestId,
+          settlementRef: settlementRef.ref,
+          amount: verified.amount,
+        });
         return settlementRef;
       };
 
@@ -356,8 +406,8 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
 
       // ── Step 7: attach receipt if settlement occurred ────────────────────
       if (settlementRef) {
-        const receipt: MppReceipt = {
-          mppVersion: MPP_VERSION,
+        const receipt: MpxReceipt = {
+          mpxVersion: MPX_VERSION,
           paymentRequestId: auth.paymentRequestId,
           rail: auth.rail,
           settlementRef: settlementRef.ref,

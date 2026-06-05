@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPaymentExtension } from '../src/server/with-payment.js';
 import { InMemoryChallengeStore } from '../src/server/challenge-store.js';
-import { META_KEYS, MPP_VERSION } from '../src/protocol/meta.js';
+import { META_KEYS, MPX_VERSION } from '../src/protocol/meta.js';
 import type { PaymentRail, PaymentIntent, VerifiedAuthorization, SettlementStrategy, SettlementRef } from '../src/rails/rail.js';
 import type { RailOffer } from '../src/protocol/schema.js';
 
@@ -63,7 +63,7 @@ function makeSpec(payTo = '0xpayee') {
 function makeAuth(paymentRequestId: string) {
   return {
     [META_KEYS.authorization]: {
-      mppVersion: MPP_VERSION,
+      mpxVersion: MPX_VERSION,
       paymentRequestId,
       rail: FAKE_RAIL_ID,
       payload: { signed: true },
@@ -85,7 +85,7 @@ describe('createPaymentExtension / withPayment', () => {
     assert.equal(result.isError, true);
     const meta = result._meta as Record<string, unknown>;
     const challenge = meta[META_KEYS.challenge] as Record<string, unknown>;
-    assert.equal(challenge.mppVersion, MPP_VERSION);
+    assert.equal(challenge.mpxVersion, MPX_VERSION);
     assert.ok(typeof challenge.paymentRequestId === 'string');
     assert.ok(Array.isArray(challenge.accepts));
     assert.equal((challenge.accepts as unknown[]).length, 1);
@@ -156,7 +156,7 @@ describe('createPaymentExtension / withPayment', () => {
     const badAuth = {
       _meta: {
         [META_KEYS.authorization]: {
-          mppVersion: MPP_VERSION,
+          mpxVersion: MPX_VERSION,
           paymentRequestId: id,
           rail: 'nonexistent-rail',
           payload: {},

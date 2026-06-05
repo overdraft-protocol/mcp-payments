@@ -9,11 +9,22 @@
  * Peer deps required: x402, viem.
  */
 
-import type { PaymentRail, PaymentIntent, VerifiedAuthorization } from '../rail.js';
+import type { PaymentRail, PaymentIntent, VerifiedAuthorization, SettlementStrategy, SettlementRef } from '../rail.js';
 import type { RailOffer } from '../../protocol/schema.js';
 import { inspectRawPaymentPayload, normalizeX402PaymentPayload } from './normalize.js';
+import {
+  coerceX402Authorization,
+  x402RetryInstructions,
+  X402_AUTHORIZATION_ARG_DESCRIPTION,
+} from './authorization.js';
+import { RAIL_ID } from './rail-id.js';
 
-export const RAIL_ID = 'x402-evm-exact';
+export { RAIL_ID };
+export {
+  coerceX402Authorization,
+  x402RetryInstructions,
+  X402_AUTHORIZATION_ARG_DESCRIPTION,
+} from './authorization.js';
 
 export interface X402EvmRailConfig {
   /** A viem PublicClient connected to the target network (e.g. Base mainnet). */
@@ -31,6 +42,10 @@ export interface X402EvmRailConfig {
   currencySymbol: string;
   /** Decimal places, e.g. 6 for USDC. */
   decimals: number;
+  /** EIP-712 token name used in the x402 `extra` field. Default: "USD Coin". */
+  assetName?: string;
+  /** EIP-712 token version used in the x402 `extra` field. Default: "2". */
+  assetVersion?: string;
 }
 
 /**
@@ -80,7 +95,7 @@ export function createX402EvmRail(cfg: X402EvmRailConfig): PaymentRail {
           payTo: intent.payTo,
           maxTimeoutSeconds,
           asset: cfg.assetAddress,
-          extra: { name: 'USD Coin', version: '2' },
+          extra: { name: cfg.assetName ?? 'USD Coin', version: cfg.assetVersion ?? '2' },
         },
       };
     },
@@ -92,45 +107,20 @@ export function createX402EvmRail(cfg: X402EvmRailConfig): PaymentRail {
       const { safeBase64Encode } = await import('x402/shared');
 
       const requirements = offer.requirements;
-      const rawInspection = inspectRawPaymentPayload(payload);
-      console.log('[payment] x402_raw_payload', JSON.stringify(rawInspection));
 
-      let normalized: Record<string, unknown>;
-      try {
-        normalized = normalizeX402PaymentPayload(payload, offer.requirements);
-      } catch (err) {
-        console.error('[payment] x402_normalize_failed', JSON.stringify({
-          error: String(err),
-          raw: rawInspection,
-          offer_network: requirements.network,
-          offer_payTo: requirements.payTo,
-          offer_maxAmount: requirements.maxAmountRequired,
-        }));
-        throw err;
-      }
-
-      console.log('[payment] x402_normalized_payload', JSON.stringify({
-        x402Version: normalized.x402Version,
-        scheme: normalized.scheme,
-        network: normalized.network,
-        authorization_from: (normalized.payload as { authorization?: { from?: string } })?.authorization?.from,
-        authorization_to: (normalized.payload as { authorization?: { to?: string } })?.authorization?.to,
-        authorization_value: (normalized.payload as { authorization?: { value?: string } })?.authorization?.value,
-      }));
+      // Diagnostic context is attached to thrown errors (and surfaced via the
+      // core's structured logger) rather than written to console here — a
+      // library must not decide where its host logs.
+      const normalized = normalizeX402PaymentPayload(payload, requirements);
 
       const payloadJson = safeBase64Encode(JSON.stringify(normalized));
       let decoded;
       try {
         decoded = exact.evm.decodePayment(payloadJson);
       } catch (err) {
-        console.error('[payment] x402_decode_failed', JSON.stringify({
-          error: String(err),
-          normalized,
-          raw: rawInspection,
-        }));
         throw new Error(
           `${String(err)}. ` +
-          'MPP authorization.payload must be the x402 PaymentPayload from sign_payment_authorization.paymentPayload ' +
+          'MPX authorization.payload must be the x402 PaymentPayload from sign_payment_authorization.paymentPayload ' +
           '(top-level network:"base", scheme:"exact") — not the wallet tool wrapper or inner signature/authorization only.',
         );
       }
@@ -138,23 +128,8 @@ export function createX402EvmRail(cfg: X402EvmRailConfig): PaymentRail {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await exact.evm.verify(cfg.publicClient as any, decoded, requirements as any);
       if (!result.isValid) {
-        console.error('[payment] x402_verify_invalid', JSON.stringify({
-          invalidReason: result.invalidReason ?? 'unknown',
-          offer_network: requirements.network,
-          offer_payTo: requirements.payTo,
-          offer_asset: requirements.asset,
-          offer_maxAmount: requirements.maxAmountRequired,
-          decoded_network: (decoded as { network?: string }).network,
-          authorization: (decoded.payload as { authorization?: unknown })?.authorization,
-        }));
         throw new Error(`x402 verification failed: ${result.invalidReason ?? 'unknown'}`);
       }
-
-      console.log('[payment] x402_verify_ok', JSON.stringify({
-        from: (decoded.payload as { authorization: { from: string } }).authorization.from,
-        to: (decoded.payload as { authorization: { to: string } }).authorization.to,
-        value: (decoded.payload as { authorization: { value: string } }).authorization.value,
-      }));
 
       // Extract actual authorized amount from the EIP-3009 field.
       const evmPayload = decoded.payload as { authorization: { value: string } };
@@ -170,6 +145,71 @@ export function createX402EvmRail(cfg: X402EvmRailConfig): PaymentRail {
         },
         raw: decoded,
       };
+    },
+
+    coerceAuthorization: coerceX402Authorization,
+    retryInstructions: x402RetryInstructions,
+    describePayload: inspectRawPaymentPayload,
+    authorizationArgDescription: X402_AUTHORIZATION_ARG_DESCRIPTION,
+  };
+}
+
+// ── Payer-side helper ─────────────────────────────────────────────────────────
+
+/**
+ * Payer-side signing: produce the x402 PaymentPayload for a challenge offer
+ * using a viem account/wallet, via x402's `exact.evm.createPayment`. Wrap the
+ * result as `{ paymentRequestId, paymentPayload }` and send it back as the
+ * `payment_authorization` argument (or `params._meta` authorization).
+ *
+ * In agent setups the wallet MCP server signs instead; this helper covers
+ * scripted/test/non-agent payers. Requires the `x402` and `viem` peer deps.
+ */
+export async function signX402Authorization(opts: {
+  /** A viem LocalAccount or SignerWallet for the payer. */
+  account: unknown;
+  /** The chosen offer from challenge.accepts (must be this rail). */
+  offer: RailOffer;
+  /** x402 protocol version. Default 1. */
+  x402Version?: number;
+}): Promise<{ paymentPayload: unknown }> {
+  const { exact } = await import('x402/schemes');
+  const paymentPayload = await exact.evm.createPayment(
+    opts.account as never,
+    opts.x402Version ?? 1,
+    opts.offer.requirements as never,
+  );
+  return { paymentPayload };
+}
+
+// ── Settlement strategy ───────────────────────────────────────────────────────
+
+/**
+ * Ready-made SettlementStrategy that performs a bare USDC transfer on-chain via
+ * x402's `exact.evm.settle` (transferWithAuthorization). This is the generic
+ * "pay the payee directly" path — use it when you do NOT need application
+ * binding in contract storage. Apps that bind funds to an order/escrow
+ * (like a marketplace) implement their own SettlementStrategy instead.
+ *
+ * Uses the offer requirements from the settlement `context`, so the same terms
+ * that were verified are the ones settled. Requires the `x402`/`viem` peer deps.
+ */
+export function createX402TransferSettlement(opts: {
+  /** A viem SignerWallet (the facilitator/operator) that submits the transfer. */
+  wallet: unknown;
+}): SettlementStrategy {
+  return {
+    async settle(verified, _binding, context): Promise<SettlementRef> {
+      const { exact } = await import('x402/schemes');
+      const res = (await exact.evm.settle(
+        opts.wallet as never,
+        verified.raw as never,
+        context.offer.requirements as never,
+      )) as unknown as { success: boolean; transaction?: string; network?: string; errorReason?: string };
+      if (!res.success) {
+        throw new Error(`x402 settle failed: ${res.errorReason ?? 'unknown'}`);
+      }
+      return { ref: res.transaction ?? '', network: res.network };
     },
   };
 }

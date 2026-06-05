@@ -1,7 +1,6 @@
-import type { MppChallenge } from '../protocol/schema.js';
-import { MPP_VERSION } from '../protocol/meta.js';
-
-const X402_EVM_RAIL_ID = 'x402-evm-exact';
+import type { MpxChallenge } from '../../protocol/schema.js';
+import { MPX_VERSION } from '../../protocol/meta.js';
+import { RAIL_ID } from './rail-id.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -23,18 +22,19 @@ function isX402Envelope(v: unknown): v is Record<string, unknown> {
   return typeof v.scheme === 'string' && typeof v.network === 'string' && v.payload !== undefined;
 }
 
-
 /**
- * Normalize agent-supplied payment_authorization into a valid MPP authorization object.
+ * Normalize agent-supplied payment_authorization into a valid MPX authorization object.
  *
  * Expected format (x402 standard):
  *   { paymentRequestId: "<uuid from challenge>",
  *     paymentPayload: { x402Version, scheme, network, payload: { signature, authorization } } }
  *
- * Also accepts the full MPP envelope if the agent constructs it manually:
- *   { mppVersion, paymentRequestId, rail, payload: <x402 PaymentPayload> }
+ * Also accepts the full MPX envelope if the agent constructs it manually:
+ *   { mpxVersion, paymentRequestId, rail, payload: <x402 PaymentPayload> }
+ *
+ * Wired into the rail as `PaymentRail.coerceAuthorization`.
  */
-export function coerceAgentPaymentAuthorization(
+export function coerceX402Authorization(
   raw: unknown,
   hints?: { paymentRequestId?: string },
 ): unknown {
@@ -44,11 +44,11 @@ export function coerceAgentPaymentAuthorization(
   if (!isRecord(parsed)) return raw;
 
   const paymentRequestId = paymentRequestIdFrom(parsed) ?? hints?.paymentRequestId;
-  const rail = typeof parsed.rail === 'string' ? parsed.rail : X402_EVM_RAIL_ID;
-  const mppVersion = typeof parsed.mppVersion === 'number' ? parsed.mppVersion : MPP_VERSION;
+  const rail = typeof parsed.rail === 'string' ? parsed.rail : RAIL_ID;
+  const mpxVersion = typeof parsed.mpxVersion === 'number' ? parsed.mpxVersion : MPX_VERSION;
 
-  // Already a complete MPP authorization — pass through for schema validation.
-  if (parsed.mppVersion !== undefined && paymentRequestId && parsed.payload !== undefined) {
+  // Already a complete MPX authorization — pass through for schema validation.
+  if (parsed.mpxVersion !== undefined && paymentRequestId && parsed.payload !== undefined) {
     return parsed;
   }
 
@@ -56,24 +56,26 @@ export function coerceAgentPaymentAuthorization(
 
   // Standard x402 format: { paymentRequestId, paymentPayload: <x402 envelope> }
   if (isX402Envelope(parsed.paymentPayload)) {
-    return { mppVersion, paymentRequestId, rail, payload: parsed.paymentPayload };
+    return { mpxVersion, paymentRequestId, rail, payload: parsed.paymentPayload };
   }
 
   // { paymentRequestId, payload: <x402 envelope> } — agent skipped the paymentPayload wrapper
   if (isX402Envelope(parsed.payload)) {
-    return { mppVersion, paymentRequestId, rail, payload: parsed.payload };
+    return { mpxVersion, paymentRequestId, rail, payload: parsed.payload };
   }
 
   return parsed;
 }
 
-export const PAYMENT_AUTHORIZATION_ARG_DESCRIPTION =
+export const X402_AUTHORIZATION_ARG_DESCRIPTION =
   'JSON string: { "paymentRequestId": "<uuid from challenge>", "paymentPayload": <x402 PaymentPayload from wallet> }. ' +
   'Sign with your wallet\'s x402 payment tool using accepts[0].requirements, ' +
   'then pass the returned paymentPayload here alongside the paymentRequestId from the challenge.';
 
-export function paymentRetryInstructions(challenge: MppChallenge): string {
-  const req = challenge.accepts[0]?.requirements;
+/** Wired into the rail as `PaymentRail.retryInstructions`. */
+export function x402RetryInstructions(challenge: MpxChallenge): string {
+  const offer = challenge.accepts.find(a => a.rail === RAIL_ID) ?? challenge.accepts[0];
+  const req = offer?.requirements;
 
   return [
     '',
