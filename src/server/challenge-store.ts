@@ -37,6 +37,13 @@ export interface ChallengeStore {
    * Implementations must make this atomic (INSERT … ON CONFLICT or equivalent).
    */
   consume(paymentRequestId: string): Promise<ChallengeRecord | undefined>;
+
+  /**
+   * Return a previously consumed challenge to the live pool after a handler
+   * failure so the agent can retry with the same signed authorization.
+   * No-op if the challenge has expired.
+   */
+  release(record: ChallengeRecord): Promise<void>;
 }
 
 // ── Default: in-memory (suitable for tests and single-process servers) ────────
@@ -63,5 +70,10 @@ export class InMemoryChallengeStore implements ChallengeStore {
     if (!record) return undefined;
     this.records.delete(paymentRequestId);
     return record;
+  }
+
+  async release(record: ChallengeRecord): Promise<void> {
+    if (new Date(record.challenge.expiresAt) < new Date()) return;
+    this.records.set(record.challenge.paymentRequestId, record);
   }
 }

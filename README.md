@@ -80,7 +80,7 @@ On success, the result carries a receipt in `result._meta`:
 
 ### Security
 
-- **Single-use challenges** — each `paymentRequestId` is consumed on use. A replayed byte-identical authorization is rejected even though it cryptographically verifies.
+- **Single-use on success** — each `paymentRequestId` is consumed only after the handler completes successfully. Verification and handler failures release the challenge so the agent can retry with the same signed authorization until `expiresAt`. A replay after success is rejected even though the authorization still verifies cryptographically.
 - **Expiry** — challenges expire (default 300 seconds). The server rejects authorizations after `expiresAt`.
 - **Verify before settle** — the package verifies the authorization before calling the tool handler. The handler's `settle()` callback moves funds *after* any application-level validation (e.g. content signatures). Money never moves on an invalid request.
 - **Conditional gating** — `intent()` can return `null` to skip the challenge entirely for calls that don't require payment.
@@ -285,6 +285,13 @@ class MyDurableChallengeStore implements ChallengeStore {
     if (!record) return undefined;
     await db.update('payment_challenges', { consumed: true }, { id: paymentRequestId });
     return record;
+  }
+
+  async release(record: ChallengeRecord): Promise<void> {
+    if (new Date(record.challenge.expiresAt) < new Date()) return;
+    await db.update('payment_challenges', { consumed: false, data: JSON.stringify(record) }, {
+      id: record.challenge.paymentRequestId,
+    });
   }
 }
 ```

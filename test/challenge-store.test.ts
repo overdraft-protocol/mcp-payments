@@ -79,4 +79,28 @@ describe('InMemoryChallengeStore', () => {
     const found = await store.get(record.challenge.paymentRequestId);
     assert.equal(found, undefined);
   });
+
+  it('release restores a consumed challenge for retry', async () => {
+    const store = new InMemoryChallengeStore();
+    const record = makeRecord();
+    await store.save(record);
+    const id = record.challenge.paymentRequestId;
+
+    await store.consume(id);
+    assert.equal(await store.get(id), undefined);
+
+    await store.release(record);
+    assert.deepEqual(await store.get(id), record);
+  });
+
+  it('release is a no-op for an expired record', async () => {
+    const store = new InMemoryChallengeStore();
+    const record = makeRecord(-1);
+    await store.save(record);
+    const id = record.challenge.paymentRequestId;
+
+    await store.consume(id);
+    await store.release(record);
+    assert.equal(await store.get(id), undefined);
+  });
 });

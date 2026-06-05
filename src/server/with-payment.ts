@@ -129,6 +129,13 @@ function attachReceipt<T extends object>(result: T, receipt: MppReceipt): T & { 
   };
 }
 
+function isErrorResult(result: unknown): result is { isError: true } {
+  return typeof result === 'object'
+    && result !== null
+    && 'isError' in result
+    && (result as { isError?: unknown }).isError === true;
+}
+
 // ── Main factory ──────────────────────────────────────────────────────────────
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -248,8 +255,8 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
         inspectMppAuthorization(authRaw, authSource ?? 'unknown'),
       );
 
-      // ── Step 3: consume the challenge (single-use) ───────────────────────
-      const record = await cfg.store.consume(auth.paymentRequestId);
+      // ── Step 3: load the challenge (not consumed until handler succeeds) ───
+      const record = await cfg.store.get(auth.paymentRequestId);
       if (!record) {
         return {
           isError: true as const,
@@ -301,7 +308,7 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
         const isSigError = errStr.includes('invalid_exact_evm_payload_signature');
         const guidance = isSigError
           ? ' Call the tool without payment_authorization to get a fresh challenge and follow the HOW TO PAY instructions exactly: call sign_payment_authorization with argument name "paymentRequirements" (not any other name) and pass the paymentPayload it returns.'
-          : '';
+          : ' You may retry with the same paymentRequestId and signed authorization.';
         return {
           isError: true as const,
           content: [{ type: 'text' as const, text: `payment_error: authorization verification failed — ${errStr}.${guidance}` }],
@@ -313,7 +320,16 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
         amount: verified.amount,
       });
 
-      // ── Step 5: inject settle() + verifiedPayment — handler calls settle() post-validation
+      // ── Step 5: claim the challenge before handler side effects ────────────
+      const claimed = await cfg.store.consume(auth.paymentRequestId);
+      if (!claimed) {
+        return {
+          isError: true as const,
+          content: [{ type: 'text' as const, text: 'payment_error: challenge expired, already used, or not found. Restart the payment flow by calling the tool without authorization first.' }],
+        };
+      }
+
+      // ── Step 6: inject settle() + verifiedPayment — handler calls settle() post-validation
       let settlementRef: SettlementRef | undefined;
       const settle = async (): Promise<SettlementRef> => {
         if (settlementRef) return settlementRef; // idempotent
@@ -321,13 +337,24 @@ export function createPaymentExtension(cfg: PaymentExtensionConfig) {
         return settlementRef;
       };
 
-      const result = await handler(args, {
-        ...extra,
-        verifiedPayment: verified,
-        settle,
-      });
+      let result: unknown;
+      try {
+        result = await handler(args, {
+          ...extra,
+          verifiedPayment: verified,
+          settle,
+        });
+      } catch (err) {
+        await cfg.store.release(claimed);
+        throw err;
+      }
 
-      // ── Step 6: attach receipt if settlement occurred ────────────────────
+      if (isErrorResult(result)) {
+        await cfg.store.release(claimed);
+        return result;
+      }
+
+      // ── Step 7: attach receipt if settlement occurred ────────────────────
       if (settlementRef) {
         const receipt: MppReceipt = {
           mppVersion: MPP_VERSION,

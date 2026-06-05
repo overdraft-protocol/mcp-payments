@@ -183,12 +183,85 @@ describe('createPaymentExtension / withPayment', () => {
 
     const challenge = await handler1(withPayment, spec, store);
     const id = challenge.paymentRequestId as string;
+    const auth = { _meta: makeAuth(id) };
 
     const wrapped = withPayment(spec, async () => ({ content: [] }));
-    const result = await wrapped({}, { _meta: makeAuth(id) }) as Record<string, unknown>;
+    const result = await wrapped({}, auth) as Record<string, unknown>;
     assert.equal(result.isError, true);
     const text = (result.content as { text: string }[])[0].text;
     assert.ok(text.includes('verification failed'));
+
+    // Challenge was not consumed — retry with the same authorization is allowed.
+    const failAgain = await wrapped({}, auth) as Record<string, unknown>;
+    assert.equal(failAgain.isError, true);
+    assert.ok((failAgain.content as { text: string }[])[0].text.includes('verification failed'));
+  });
+
+  it('verify failure then success with the same paymentRequestId', async () => {
+    let verifyCalls = 0;
+    const rail: PaymentRail = {
+      id: FAKE_RAIL_ID,
+      buildOffer(intent: PaymentIntent): RailOffer {
+        return { rail: FAKE_RAIL_ID, payTo: intent.payTo, requirements: { amount: intent.amount.value } };
+      },
+      async verify(): Promise<VerifiedAuthorization> {
+        verifyCalls += 1;
+        if (verifyCalls === 1) throw new Error('transient verify failure');
+        return {
+          rail: FAKE_RAIL_ID,
+          amount: { value: '1.00', currency: 'USDC', decimals: 6 },
+          raw: { verified: true },
+        };
+      },
+    };
+
+    const store = new InMemoryChallengeStore();
+    const { strategy, calls } = makeSettlement('tx-retry');
+    const withPayment = createPaymentExtension({ rails: [rail], store, settlement: strategy });
+    const spec = makeSpec();
+    const challenge = await handler1(withPayment, spec, store);
+    const id = challenge.paymentRequestId as string;
+    const auth = { _meta: makeAuth(id) };
+
+    const wrapped = withPayment(spec, async (_args, extra) => {
+      await extra.settle();
+      return { content: [{ type: 'text', text: 'done' }] };
+    });
+
+    const first = await wrapped({}, auth) as Record<string, unknown>;
+    assert.equal(first.isError, true);
+
+    const second = await wrapped({}, auth) as Record<string, unknown>;
+    assert.equal(second.isError, undefined);
+    assert.equal(calls.length, 1);
+  });
+
+  it('handler failure releases the challenge for retry', async () => {
+    const store = new InMemoryChallengeStore();
+    const { strategy, calls } = makeSettlement();
+    const withPayment = createPaymentExtension({ rails: [makeFakeRail()], store, settlement: strategy });
+    const spec = makeSpec();
+    const challenge = await handler1(withPayment, spec, store);
+    const id = challenge.paymentRequestId as string;
+    const auth = { _meta: makeAuth(id) };
+
+    let attempts = 0;
+    const wrapped = withPayment(spec, async (_args, extra) => {
+      attempts += 1;
+      if (attempts === 1) {
+        return { isError: true as const, content: [{ type: 'text', text: 'handler failed' }] };
+      }
+      await extra.settle();
+      return { content: [{ type: 'text', text: 'done' }] };
+    });
+
+    const first = await wrapped({}, auth) as Record<string, unknown>;
+    assert.equal(first.isError, true);
+    assert.equal(calls.length, 0);
+
+    const second = await wrapped({}, auth) as Record<string, unknown>;
+    assert.equal(second.isError, undefined);
+    assert.equal(calls.length, 1);
   });
 
   it('conditional gating: intent() returning null passes through without payment', async () => {
